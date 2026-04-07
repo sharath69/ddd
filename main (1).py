@@ -6,6 +6,9 @@ Deal Post Bot v6 — Fixed Flipkart scraping + Groq title shortening
   • Updated caption: combined savings line, effective price
 """
 
+from dotenv import load_dotenv
+load_dotenv()
+
 import os
 import re
 import json
@@ -21,7 +24,6 @@ import requests
 from bs4 import BeautifulSoup
 from fake_useragent import UserAgent
 from PIL import Image as PILImage
-from html2image import Html2Image
 from jinja2 import Template
 from telegram import Update
 from telegram.ext import (
@@ -1013,6 +1015,311 @@ body{
 )
 
 
+
+# ────────────────────────────────────────────────────────────────────
+# 8a. PILLOW-BASED RENDERER (no Chrome required)
+# ────────────────────────────────────────────────────────────────────
+
+def _weasyprint_render(html: str, width: int):
+    """Render HTML to PNG using WeasyPrint — pure Python, no Chrome needed."""
+    from weasyprint import HTML, CSS
+    from weasyprint.text.fonts import FontConfiguration
+
+    font_config = FontConfiguration()
+    css = CSS(string=f"""
+        @page {{
+            width: {width}px;
+            margin: 0;
+        }}
+        body {{
+            margin: 0;
+            padding: 0;
+            width: {width}px;
+        }}
+    """, font_config=font_config)
+
+    # WeasyPrint renders to PNG
+    buf_out = BytesIO()
+    HTML(string=html).write_png(buf_out, stylesheets=[css], font_config=font_config, resolution=96)
+    png_bytes = buf_out.getvalue()
+
+    # Auto-crop whitespace from bottom — fast bbox method
+    from PIL import ImageChops
+    img = PILImage.open(BytesIO(png_bytes)).convert("RGB")
+    bg = PILImage.new("RGB", img.size, (255, 255, 255))
+    diff = ImageChops.difference(img, bg)
+    bbox = diff.getbbox()
+    if bbox:
+        img = img.crop((0, 0, img.width, bbox[3] + 16))
+    buf = BytesIO()
+    img.save(buf, format="PNG", optimize=False, compress_level=1)
+    buf.seek(0)
+    return buf
+
+# ── Font cache: loaded once at startup, reused every render ──
+from PIL import ImageFont as _ImageFont
+
+def _find_font_path(names):
+    bases = [
+        "/usr/share/fonts/truetype/dejavu/",
+        "/usr/share/fonts/truetype/liberation/",
+        "/usr/share/fonts/truetype/freefont/",
+        "/usr/share/fonts/",
+        "/usr/local/share/fonts/",
+    ]
+    for name in names:
+        for base in bases:
+            path = base + name
+            if os.path.exists(path):
+                return path
+    return None
+
+_FONT_PATH = _find_font_path(["DejaVuSans.ttf", "Arial.ttf", "FreeSans.ttf", "LiberationSans-Regular.ttf"])
+_FONT_BOLD_PATH = _find_font_path(["DejaVuSans-Bold.ttf", "FreeSansBold.ttf", "LiberationSans-Bold.ttf"])
+
+_FONT_CACHE: dict = {}
+
+def _load_font(size):
+    key = ("regular", size)
+    if key not in _FONT_CACHE:
+        try:
+            _FONT_CACHE[key] = _ImageFont.truetype(_FONT_PATH, size) if _FONT_PATH else _ImageFont.load_default()
+        except Exception:
+            _FONT_CACHE[key] = _ImageFont.load_default()
+    return _FONT_CACHE[key]
+
+def _load_font_bold(size):
+    key = ("bold", size)
+    if key not in _FONT_CACHE:
+        try:
+            path = _FONT_BOLD_PATH or _FONT_PATH
+            _FONT_CACHE[key] = _ImageFont.truetype(path, size) if path else _ImageFont.load_default()
+        except Exception:
+            _FONT_CACHE[key] = _ImageFont.load_default()
+    return _FONT_CACHE[key]
+
+
+def _draw_text(draw, pos, text, font, fill, max_width=None):
+    """Draw text, wrapping if max_width given. Returns final y."""
+    from PIL import ImageDraw
+    x, y = pos
+    if not max_width:
+        draw.text((x, y), text, font=font, fill=fill)
+        bbox = font.getbbox(text)
+        return y + (bbox[3] - bbox[1]) + 4
+    # word wrap
+    words = text.split()
+    line = ""
+    for word in words:
+        test = (line + " " + word).strip()
+        bbox = font.getbbox(test)
+        if bbox[2] - bbox[0] > max_width and line:
+            draw.text((x, y), line, font=font, fill=fill)
+            bbox2 = font.getbbox(line)
+            y += (bbox2[3] - bbox2[1]) + 6
+            line = word
+        else:
+            line = test
+    if line:
+        draw.text((x, y), line, font=font, fill=fill)
+        bbox = font.getbbox(line)
+        y += (bbox[3] - bbox[1]) + 6
+    return y
+
+
+def _pillow_render(marketplace, bd, img_b64, orig_w, orig_h):
+    from PIL import ImageDraw, ImageFont
+
+    # ── Layout ──
+    W = 800
+    PAD = 28
+    IMG_MAX = 300
+
+    # Decode product image
+    try:
+        prod_img = PILImage.open(BytesIO(base64.b64decode(img_b64))).convert("RGBA")
+        prod_img.thumbnail((IMG_MAX, IMG_MAX), PILImage.BICUBIC)
+        prod_img = prod_img.convert("RGB")
+    except Exception:
+        prod_img = PILImage.new("RGB", (IMG_MAX, IMG_MAX), (240, 240, 240))
+
+    # Fonts
+    f12 = _load_font(12)
+    f14 = _load_font(14)
+    f15 = _load_font(15)
+    f16 = _load_font(16)
+    f18 = _load_font(18)
+    f20 = _load_font_bold(20)
+    f22 = _load_font_bold(22)
+
+    # ── Estimate height ──
+    RIGHT_W = W - PAD*3 - prod_img.width
+    H = max(prod_img.height + PAD*2, 500) + 60
+    if marketplace == "amazon" and bd.get("coupon_disc", 0) > 0:
+        H += 70
+
+    canvas = PILImage.new("RGB", (W, H), (255, 255, 255))
+    draw = ImageDraw.Draw(canvas)
+
+    # Paste product image
+    img_x = PAD
+    img_y = PAD
+    canvas.paste(prod_img, (img_x, img_y))
+
+    # Right panel start
+    rx = PAD*2 + prod_img.width
+    ry = PAD
+
+    if marketplace == "amazon":
+        # ── Coupon card ──
+        if bd.get("coupon_disc", 0) > 0:
+            card_h = 60
+            draw.rounded_rectangle([rx, ry, W-PAD, ry+card_h], radius=8,
+                                    fill=(255,255,255), outline=(231,231,231), width=1)
+            draw.text((rx+16, ry+10), "Coupon Discount", font=f18, fill=(15,17,17))
+            coupon_txt = f"Save ₹{bd['coupon_disc']:,} with coupon"
+            draw.text((rx+16, ry+32), coupon_txt, font=f14, fill=(0,118,0))
+            draw.rounded_rectangle([W-PAD-70, ry+14, W-PAD-8, ry+card_h-14],
+                                    radius=6, fill=(255,255,255), outline=(141,144,150), width=1)
+            draw.text((W-PAD-55, ry+18), "Apply", font=f14, fill=(15,17,17))
+            ry += card_h + 16
+
+        # ── Price breakdown box ──
+        COL1 = rx
+        COL2 = W - PAD
+        LINE_H = 28
+
+        def row(label, value, font_l=f16, font_v=f16, col_l=(15,17,17), col_v=(15,17,17)):
+            nonlocal ry
+            draw.text((COL1, ry), label, font=font_l, fill=col_l)
+            bbox = font_v.getbbox(value)
+            vw = bbox[2] - bbox[0]
+            draw.text((COL2 - vw, ry), value, font=font_v, fill=col_v)
+            ry += LINE_H
+
+        row("Items:", f"₹{bd['price']:,}")
+        row("Delivery:", "₹0.00")
+        row("Total:", f"₹{bd['price']:,}")
+
+        # Savings box
+        total_savings = bd.get("coupon_disc", 0) + bd.get("best_bank_disc", 0)
+        savings_count = (1 if bd.get("coupon_disc", 0) > 0 else 0) +                         (1 if bd.get("best_bank_disc", 0) > 0 else 0)
+        if total_savings > 0:
+            ry += 4
+            box_top = ry
+            ry += 8
+
+            # Row 1: "Savings (N):"  and  total savings amount — on same line
+            savings_label = f"Savings ({savings_count}):"
+            sv_val = f"-₹{total_savings:,}"
+            draw.text((COL1 + 8, ry), savings_label, font=f16, fill=(0, 113, 133))
+            sv_bbox = f16.getbbox(sv_val)
+            draw.text((COL2 - (sv_bbox[2] - sv_bbox[0]), ry), sv_val, font=f16, fill=(0, 118, 0))
+            ry += LINE_H
+
+            # Row 2: bank discount (indented, left only — value on right)
+            if bd.get("best_bank_disc", 0) > 0:
+                bank_name = bd.get("best_bank", "Bank")
+                bank_label = f"  {bank_name} Discount:"
+                bank_val = f"-₹{bd['best_bank_disc']:,}"
+                draw.text((COL1 + 8, ry), bank_label, font=f15, fill=(15, 17, 17))
+                bv_bbox = f15.getbbox(bank_val)
+                draw.text((COL2 - (bv_bbox[2] - bv_bbox[0]), ry), bank_val, font=f15, fill=(15, 17, 17))
+                ry += LINE_H
+
+            # Row 3: coupon savings
+            if bd.get("coupon_disc", 0) > 0:
+                cpn_label = "  Your Coupon Savings"
+                cpn_val = f"-₹{bd['coupon_disc']:,}"
+                draw.text((COL1 + 8, ry), cpn_label, font=f15, fill=(15, 17, 17))
+                cv_bbox = f15.getbbox(cpn_val)
+                draw.text((COL2 - (cv_bbox[2] - cv_bbox[0]), ry), cpn_val, font=f15, fill=(15, 17, 17))
+                ry += LINE_H
+
+            ry += 6
+            draw.rectangle([rx - 4, box_top, W - PAD + 4, ry], outline=(250, 90, 79), width=3)
+            ry += 12
+
+        # Divider
+        draw.line([(COL1, ry), (COL2, ry)], fill=(15,17,17), width=2)
+        ry += 10
+        row("Order Total:", f"₹{bd['effective']:,}", font_l=f22, font_v=f22)
+
+    else:
+        # ── Flipkart style ──
+        box_x1, box_y1 = rx, ry
+        box_x2 = W - PAD
+        inner_w = box_x2 - box_x1
+
+        # Header bg
+        draw.rectangle([box_x1, box_y1, box_x2, box_y1+40], fill=(244,245,250))
+        draw.text((box_x1+12, box_y1+10), "MRP (incl. of all taxes)", font=f15, fill=(33,33,33))
+        mrp_txt = f"₹{bd['mrp']:,}"
+        mrp_bbox = f15.getbbox(mrp_txt)
+        draw.text((box_x2-12-(mrp_bbox[2]-mrp_bbox[0]), box_y1+10), mrp_txt, font=f15, fill=(33,33,33))
+        ry = box_y1 + 50
+
+        mrp_discount = max(0, bd["mrp"] - bd["price"])
+        has_discount = mrp_discount > 0 or bd.get("coupon_disc",0) > 0 or bd.get("best_bank_disc",0) > 0
+
+        if has_discount:
+            draw.text((box_x1+12, ry), "Discounts", font=f15, fill=(33,33,33))
+            ry += 30
+
+            # Red bordered box
+            inner_top = ry
+            ry += 12
+
+            def fk_row(label, value, col_v=(11,158,77)):
+                nonlocal ry
+                draw.text((box_x1+20, ry), label, font=f15, fill=(107,114,128))
+                vb = f15.getbbox(value)
+                draw.text((box_x2-20-(vb[2]-vb[0]), ry), value, font=f15, fill=col_v)
+                ry += 28
+
+            if mrp_discount > 0:
+                fk_row("MRP Discount", f"-₹{mrp_discount:,}")
+            if bd.get("coupon_disc", 0) > 0:
+                fk_row("Coupons for you", f"-₹{bd['coupon_disc']:,}")
+            if bd.get("best_bank_disc", 0) > 0:
+                fk_row("Bank Offer Discount", f"-₹{bd['best_bank_disc']:,}")
+
+            # Divider
+            ry += 4
+            draw.line([(box_x1+12, ry), (box_x2-12, ry)], fill=(224,226,231), width=1)
+            ry += 10
+
+            # Total
+            draw.text((box_x1+20, ry), "Total Amount", font=f18, fill=(40,116,240))
+            total_txt = f"₹{bd['effective']:,}"
+            tb = f20.getbbox(total_txt)
+            draw.text((box_x2-20-(tb[2]-tb[0]), ry), total_txt, font=f20, fill=(40,116,240))
+            ry += 34
+
+            draw.rectangle([box_x1, inner_top-4, box_x2, ry+4], outline=(248,69,55), width=3)
+        else:
+            draw.text((box_x1+12, ry), "Selling Price", font=f18, fill=(33,33,33))
+            sp_txt = f"₹{bd['effective']:,}"
+            sb = f20.getbbox(sp_txt)
+            draw.text((box_x2-12-(sb[2]-sb[0]), ry), sp_txt, font=f20, fill=(40,116,240))
+            ry += 36
+
+    # Crop to content — fast bbox method, no pixel loop
+    final_h = max(ry + PAD, prod_img.height + PAD*2)
+    canvas = canvas.crop((0, 0, W, min(final_h, H)))
+    # trim extra white from bottom quickly
+    bg = PILImage.new("RGB", canvas.size, (255, 255, 255))
+    diff = PILImage.new("RGB", canvas.size)
+    from PIL import ImageChops
+    diff = ImageChops.difference(canvas, bg)
+    bbox = diff.getbbox()
+    if bbox:
+        canvas = canvas.crop((0, 0, W, bbox[3] + 16))
+    buf = BytesIO()
+    canvas.save(buf, format="PNG", optimize=False, compress_level=1)
+    buf.seek(0)
+    return buf
+
 # ────────────────────────────────────────────────────────────────────
 # 8. IMAGE GENERATION
 # ────────────────────────────────────────────────────────────────────
@@ -1099,47 +1406,9 @@ def generate_deal_image(image_url, bd, bank_offers, marketplace="amazon"):
         html = AMAZON_DEAL_TEMPLATE.render(**tpl)
 
     try:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            hti = Html2Image(
-                output_path=tmpdir,
-                custom_flags=[
-                    "--no-sandbox",
-                    "--disable-gpu",
-                    "--disable-software-rasterizer",
-                    "--hide-scrollbars",
-                ],
-            )
-            fname = "deal.png"
-            hti.screenshot(
-                html_str=html,
-                save_as=fname,
-                size=(canvas_width, 900),
-            )
-            fpath = os.path.join(tmpdir, fname)
-            img = PILImage.open(fpath).convert("RGB")
-            pixels = img.load()
-            w, h = img.size
-
-            bottom = h
-            for y in range(h - 1, 0, -1):
-                row_white = all(
-                    pixels[x, y][0] > 250
-                    and pixels[x, y][1] > 250
-                    and pixels[x, y][2] > 250
-                    for x in range(0, w, 10)
-                )
-                if not row_white:
-                    bottom = y + 15
-                    break
-
-            img = img.crop((0, 0, w, min(bottom, h)))
-            buf = BytesIO()
-            img.save(buf, format="PNG", quality=95)
-            buf.seek(0)
-            return buf
-
+        return _weasyprint_render(html, canvas_width)
     except Exception as e:
-        log.error(f"html2image render error: {e}")
+        log.error(f"Weasyprint render error: {e}")
         return None
 
 
@@ -1178,10 +1447,23 @@ def format_caption(title, url, bd, avg_price):
 # 10. TELEGRAM BOT
 # ────────────────────────────────────────────────────────────────────
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "Send me any Amazon or Flipkart link.\n"
-        "I'll generate a deal post with price breakdown & offers!"
-    )
+    lines = ["Renderer check:"]
+    try:
+        import weasyprint
+        lines.append(f"✅ weasyprint {weasyprint.__version__}")
+    except Exception as e:
+        lines.append(f"❌ weasyprint: {e}")
+    try:
+        import cairosvg
+        lines.append("✅ cairosvg")
+    except Exception as e:
+        lines.append(f"❌ cairosvg: {e}")
+    try:
+        import imgkit
+        lines.append("✅ imgkit")
+    except Exception as e:
+        lines.append(f"❌ imgkit: {e}")
+    await update.message.reply_text("\n".join(lines))
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1279,9 +1561,52 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await status.edit_text(f"❌ Error: {str(e)[:100]}")
 
 
+def _find_chrome():
+    """Find Chrome/Chromium executable and log results."""
+    import shutil
+    import subprocess
+
+    log.info("=== Searching for Chrome/Chromium ===")
+
+    # which command
+    for name in ["chromium", "chromium-browser", "google-chrome", "google-chrome-stable"]:
+        path = shutil.which(name)
+        log.info(f"which {name}: {path}")
+
+    # common paths
+    candidates = [
+        "/usr/bin/chromium",
+        "/usr/bin/chromium-browser",
+        "/usr/bin/google-chrome",
+        "/usr/bin/google-chrome-stable",
+        "/snap/bin/chromium",
+        "/usr/local/bin/chromium",
+        "/usr/local/bin/chromium-browser",
+        "/opt/google/chrome/chrome",
+        "/opt/chromium/chromium",
+    ]
+    for p in candidates:
+        exists = os.path.exists(p)
+        log.info(f"  {p}: {'EXISTS' if exists else 'not found'}")
+
+    # find via filesystem
+    try:
+        result = subprocess.run(
+            ["find", "/usr", "/opt", "/snap", "-name", "chrom*", "-type", "f"],
+            capture_output=True, text=True, timeout=10
+        )
+        log.info(f"find results:\n{result.stdout[:500]}")
+    except Exception as e:
+        log.info(f"find failed: {e}")
+
+    log.info("=== End Chrome search ===")
+
+
 def main():
     if BOT_TOKEN == "YOUR_TOKEN":
         raise ValueError("Set TELEGRAM_BOT_TOKEN environment variable!")
+
+    _find_chrome()
 
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", cmd_start))
